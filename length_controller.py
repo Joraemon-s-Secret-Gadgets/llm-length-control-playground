@@ -1,0 +1,147 @@
+"""
+자기소개서 분량 재조정의 핵심 비즈니스 로직.
+LLM 호출 → 후처리 파이프라인 → 검증 → 재시도.
+
+UI(Chainlit)와 독립적으로 동작하도록 설계.
+"""
+
+from openai import AsyncOpenAI
+from text_counter import count_with_spaces
+from text_utils import (
+    fix_korean_sentence_endings,
+    ensure_paragraphs,
+    smart_trim,
+    count_paragraphs,
+    extract_numbers,
+    detect_fabricated_numbers,
+)
+from prompts import SYSTEM_PROMPT, build_initial_prompt, build_retry_prompt
+
+
+# LLM이 목표치보다 얼마나 길게 쓸지의 비율
+OVERSHOOT_RATIO = 1.15
+MAX_RETRIES = 2
+MODEL_NAME = "gpt-4o"
+
+
+class LengthController:
+    """자기소개서 분량 재조정 컨트롤러."""
+
+    def __init__(self, client: AsyncOpenAI = None):
+        self.client = client or AsyncOpenAI()
+
+    async def adjust_length(
+        self,
+        original_text: str,
+        min_len: int,
+        max_len: int,
+        on_token=None,
+        on_status=None,
+    ) -> dict:
+        """
+        원문을 목표 글자수 범위로 재조정한다.
+
+        Args:
+            original_text: 재조정할 원본 자소서
+            min_len: 최소 글자 수 (공백 포함)
+            max_len: 최대 글자 수 (공백 포함)
+            on_token: 토큰 수신 시 호출될 비동기 콜백 (optional, UI 스트리밍용)
+            on_status: 상태 변경 시 호출될 비동기 콜백 (optional, 진행률 표시용)
+
+        Returns:
+            {
+                "success": bool,
+                "text": str,          # 최종 결과물
+                "length": int,        # 최종 글자 수
+                "attempts": int,      # 총 시도 횟수
+                "errors": list,       # 마지막 검증 실패 사유 (실패 시)
+            }
+        """
+        # LLM에게 지시할 목표치 (상한의 +15%)
+        generous_target = int(max_len * OVERSHOOT_RATIO)
+        llm_min = max_len
+        llm_max = generous_target
+
+        original_num_set = extract_numbers(original_text)
+        user_prompt = build_initial_prompt(
+            original_text, llm_min, llm_max, min_len, max_len
+        )
+
+        final_text = ""
+        last_errors = []
+
+        for attempt in range(MAX_RETRIES):
+            temperature = 0.2 + (attempt * 0.2)
+
+            if on_status:
+                await on_status(
+                    f"⚙️ {min_len}~{max_len}자로 조정 중... "
+                    f"(시도 {attempt + 1}/{MAX_RETRIES}, temp={temperature:.1f})"
+                )
+
+            # LLM 호출 (스트리밍)
+            stream = await self.client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                stream=True,
+                temperature=temperature,
+            )
+
+            raw_text = ""
+            async for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    token = chunk.choices[0].delta.content
+                    raw_text += token
+                    if on_token:
+                        await on_token(token)
+
+            # 후처리 파이프라인
+            processed = fix_korean_sentence_endings(raw_text)
+            processed = ensure_paragraphs(processed, sentences_per_paragraph=3)
+            processed = smart_trim(processed, min_len, max_len)
+            processed = fix_korean_sentence_endings(processed)
+
+            final_text = processed
+            final_len = count_with_spaces(final_text)
+            paragraph_count = count_paragraphs(final_text)
+
+            # 검증
+            errors = []
+            if not (min_len <= final_len <= max_len):
+                errors.append(f"글자 수 {final_len}자 (목표 {min_len}~{max_len})")
+            if paragraph_count < 3:
+                errors.append(f"문단 {paragraph_count}개 (최소 3개)")
+
+            fabricated = detect_fabricated_numbers(original_num_set, final_text)
+            if fabricated:
+                errors.append(f"원문에 없는 수치 감지: {', '.join(fabricated[:3])}")
+
+            # 통과 시 즉시 반환
+            if not errors:
+                return {
+                    "success": True,
+                    "text": final_text,
+                    "length": final_len,
+                    "attempts": attempt + 1,
+                    "errors": [],
+                }
+
+            last_errors = errors
+
+            # 재시도 프롬프트 구성
+            if attempt < MAX_RETRIES - 1:
+                user_prompt = build_retry_prompt(
+                    original_text, final_text, errors, llm_min, llm_max
+                )
+
+        # 재시도 소진
+        return {
+            "success": False,
+            "text": final_text,
+            "length": count_with_spaces(final_text),
+            "attempts": MAX_RETRIES,
+            "errors": last_errors,
+        }
