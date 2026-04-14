@@ -33,7 +33,7 @@ from .exceptions import (                              # ⭐ 추가
 # LLM이 목표치보다 얼마나 길게 쓸지의 비율
 OVERSHOOT_RATIO = 1.15
 MAX_RETRIES = 2
-MODEL_NAME = "gpt-4o"
+MODEL_NAME = "gpt-4o-mini"
 
 
 class LengthController:
@@ -87,8 +87,6 @@ class LengthController:
             raise TextTooShortError(text_length, max_len)
 
         # === 본 로직 시작 ===
-        # LLM에게 지시할 목표치 (상한의 +15%)
-        generous_target = int(max_len * OVERSHOOT_RATIO)
         # LLM에게 지시할 목표치 (상한의 +15%)
         generous_target = int(max_len * OVERSHOOT_RATIO)
         llm_min = max_len
