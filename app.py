@@ -8,9 +8,18 @@ import re
 import chainlit as cl
 from dotenv import load_dotenv
 
-from text_counter import count_with_spaces, count_without_spaces
-from text_utils import parse_target_length, count_paragraphs
-from length_controller import LengthController
+# 짧고 깔끔하게
+from llm_length_control import (
+    LengthController,
+    parse_target_length,
+    count_paragraphs,
+    count_with_spaces,
+    count_without_spaces,
+    # 예외 클래스 ⭐ 추가
+    TextTooShortError,
+    InvalidTargetLengthError,
+    EmptyTextError,
+)
 
 
 load_dotenv()
@@ -98,21 +107,21 @@ async def run_initial_adjustment(original_text: str, min_len: int, max_len: int)
         return
 
     # 세션에 현재 결과 저장
-    cl.user_session.set("current_text", result["text"])
+    cl.user_session.set("current_text", result.text)
 
     # 결과 출력
     status_header = (
         "✅ **초기 조정 완료!**"
-        if result["success"]
-        else f"📊 **근사치 결과** (사유: {', '.join(result['errors'])})"
+        if result.success
+        else f"📊 **근사치 결과** (사유: {', '.join(result.errors)})"
     )
     summary_lines = [
         f"- 목표: {min_len}~{max_len}자",
-        f"- 결과: **{result['length']}자**",
-        f"- 시도: {result['attempts']}회",
+        f"- 결과: **{result.length}자**",
+        f"- 시도: {result.attempts}회",
     ]
 
-    await send_final_output(msg, status_header, summary_lines, result["text"])
+    await send_final_output(msg, status_header, summary_lines, result.text)
 
 
 async def revision_loop():
@@ -181,37 +190,47 @@ async def run_revision(user_feedback: str):
         await msg.update()
 
     try:
-        result = await controller.revise_text(
+        result = await controller.adjust_length(
             original_text=original_text,
-            current_text=current_text,
-            user_feedback=user_feedback,
             min_len=min_len,
             max_len=max_len,
             on_token=on_token,
             on_status=on_status,
         )
+    except TextTooShortError as e:
+        msg.content = f"⚠️ {str(e)}"
+        await msg.update()
+        return
+    except InvalidTargetLengthError as e:
+        msg.content = f"⚠️ {str(e)}"
+        await msg.update()
+        return
+    except EmptyTextError as e:
+        msg.content = f"⚠️ {str(e)}"
+        await msg.update()
+        return
     except Exception as e:
-        msg.content = f"오류 발생: {str(e)}"
+        msg.content = f"❌ 예상치 못한 오류: {str(e)}"
         await msg.update()
         return
 
     # 세션 업데이트
-    cl.user_session.set("current_text", result["text"])
+    cl.user_session.set("current_text", result.text)
     cl.user_session.set("revision_count", revision_count + 1)
 
     # 결과 출력
     status_header = (
         f"✏️ **수정 완료** (총 {revision_count + 1}회)"
-        if result["success"]
-        else f"⚠️ **수정 결과 (일부 검증 실패)**\n사유: {', '.join(result['errors'])}"
+        if result.success
+        else f"⚠️ **수정 결과 (일부 검증 실패)**\n사유: {', '.join(result.errors)}"
     )
     summary_lines = [
         f"- 수정 요청: _{user_feedback[:50]}{'...' if len(user_feedback) > 50 else ''}_",
         f"- 목표: {min_len}~{max_len}자",
-        f"- 결과: **{result['length']}자**",
+        f"- 결과: **{result.length}자**",
     ]
 
-    await send_final_output(msg, status_header, summary_lines, result["text"])
+    await send_final_output(msg, status_header, summary_lines, result.text)
 
 
 async def send_final_output(msg, status_header: str, summary_lines: list,

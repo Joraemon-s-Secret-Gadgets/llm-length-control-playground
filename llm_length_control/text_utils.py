@@ -7,7 +7,7 @@
 """
 
 import re
-from text_counter import count_with_spaces
+from .text_counter import count_with_spaces
 
 
 def fix_korean_sentence_endings(text: str) -> str:

@@ -6,8 +6,10 @@ UI(Chainlit)와 독립적으로 동작하도록 설계.
 """
 
 from openai import AsyncOpenAI
-from text_counter import count_with_spaces
-from text_utils import (
+
+# 패키지 내부 import (상대 경로)
+from .text_counter import count_with_spaces
+from .text_utils import (
     fix_korean_sentence_endings,
     ensure_paragraphs,
     smart_trim,
@@ -15,8 +17,18 @@ from text_utils import (
     extract_numbers,
     detect_fabricated_numbers,
 )
-from prompts import SYSTEM_PROMPT, build_initial_prompt, build_retry_prompt
-
+from .prompts import (
+    SYSTEM_PROMPT,
+    build_initial_prompt,
+    build_retry_prompt,
+    build_revision_prompt,
+)
+from .types import AdjustmentResult, RevisionResult
+from .exceptions import (                              # ⭐ 추가
+    EmptyTextError,
+    InvalidTargetLengthError,
+    TextTooShortError,
+)
 
 # LLM이 목표치보다 얼마나 길게 쓸지의 비율
 OVERSHOOT_RATIO = 1.15
@@ -37,7 +49,7 @@ class LengthController:
         max_len: int,
         on_token=None,
         on_status=None,
-    ) -> dict:
+    ) -> AdjustmentResult:
         """
         원문을 목표 글자수 범위로 재조정한다.
 
@@ -49,14 +61,34 @@ class LengthController:
             on_status: 상태 변경 시 호출될 비동기 콜백 (optional, 진행률 표시용)
 
         Returns:
-            {
-                "success": bool,
-                "text": str,          # 최종 결과물
-                "length": int,        # 최종 글자 수
-                "attempts": int,      # 총 시도 횟수
-                "errors": list,       # 마지막 검증 실패 사유 (실패 시)
-            }
+            AdjustmentResult: 조정 결과 객체
+                - text: 최종 자소서 본문
+                - length: 최종 글자 수
+                - success: 검증 통과 여부
+                - attempts: 총 시도 횟수
+                - errors: 검증 실패 사유 (실패 시)
         """
+        # === 입력 검증 ===
+        if not original_text or not original_text.strip():
+            raise EmptyTextError()
+
+        if min_len <= 0 or max_len <= 0:
+            raise InvalidTargetLengthError(
+                min_len, max_len, reason="글자수는 양수여야 합니다"
+            )
+
+        if min_len > max_len:
+            raise InvalidTargetLengthError(
+                min_len, max_len, reason="최소값이 최대값보다 큽니다"
+            )
+
+        text_length = count_with_spaces(original_text)
+        if text_length < max_len * 0.3:
+            raise TextTooShortError(text_length, max_len)
+
+        # === 본 로직 시작 ===
+        # LLM에게 지시할 목표치 (상한의 +15%)
+        generous_target = int(max_len * OVERSHOOT_RATIO)
         # LLM에게 지시할 목표치 (상한의 +15%)
         generous_target = int(max_len * OVERSHOOT_RATIO)
         llm_min = max_len
@@ -121,13 +153,13 @@ class LengthController:
 
             # 통과 시 즉시 반환
             if not errors:
-                return {
-                    "success": True,
-                    "text": final_text,
-                    "length": final_len,
-                    "attempts": attempt + 1,
-                    "errors": [],
-                }
+                return AdjustmentResult(
+                    success=True,
+                    text=final_text,
+                    length=final_len,
+                    attempts=attempt + 1,
+                    errors=[],
+                )
 
             last_errors = errors
 
@@ -138,25 +170,24 @@ class LengthController:
                 )
 
         # 재시도 소진
-        return {
-            "success": False,
-            "text": final_text,
-            "length": count_with_spaces(final_text),
-            "attempts": MAX_RETRIES,
-            "errors": last_errors,
-        }
-
+        return AdjustmentResult(
+            success=False,
+            text=final_text,
+            length=count_with_spaces(final_text),
+            attempts=MAX_RETRIES,
+            errors=last_errors,
+        )
 
     async def revise_text(
-            self,
-            original_text: str,
-            current_text: str,
-            user_feedback: str,
-            min_len: int,
-            max_len: int,
-            on_token=None,
-            on_status=None,
-    ) -> dict:
+        self,
+        original_text: str,
+        current_text: str,
+        user_feedback: str,
+        min_len: int,
+        max_len: int,
+        on_token=None,
+        on_status=None,
+    ) -> RevisionResult:
         """
         사용자 피드백을 반영해 기존 결과물을 수정한다.
 
@@ -168,17 +199,15 @@ class LengthController:
             on_token, on_status: UI 콜백
 
         Returns:
-            adjust_length와 동일한 형식의 결과 dict
+            RevisionResult: 수정 결과 객체
         """
-        from prompts import build_revision_prompt
-
         original_num_set = extract_numbers(original_text)
         user_prompt = build_revision_prompt(
             original_text, current_text, user_feedback, min_len, max_len
         )
 
         if on_status:
-            await on_status(f"✏️ 피드백 반영 중: \"{user_feedback[:30]}...\"")
+            await on_status(f'✏️ 피드백 반영 중: "{user_feedback[:30]}..."')
 
         stream = await self.client.chat.completions.create(
             model=MODEL_NAME,
@@ -218,9 +247,9 @@ class LengthController:
         if fabricated:
             errors.append(f"원문에 없는 수치: {', '.join(fabricated[:3])}")
 
-        return {
-            "success": len(errors) == 0,
-            "text": processed,
-            "length": final_len,
-            "errors": errors,
-        }
+        return RevisionResult(
+            success=len(errors) == 0,
+            text=processed,
+            length=final_len,
+            errors=errors,
+        )
