@@ -84,3 +84,28 @@ def build_retry_prompt(original: str, previous: str, errors: list,
         f"[원본 - 사실 기준]\n{original}\n\n"
         f"[이전 결과 - 참고용]\n{previous}"
     )
+def build_revision_prompt(
+    original_text: str,
+    current_text: str,
+    user_feedback: str,
+    target_min: int,
+    target_max: int,
+) -> str:
+    """
+    사용자 피드백을 반영해 기존 결과를 수정하는 프롬프트.
+    - 원문에 없는 사실 날조 금지
+    - 목표 글자수 유지
+    - 피드백 부분만 최소 침습적으로 수정
+    """
+    return (
+        f"사용자가 이전 결과에 대해 다음과 같은 수정 요청을 했어:\n"
+        f"「{user_feedback}」\n\n"
+        f"이 요청을 반영해서 자소서를 수정해줘. 규칙:\n"
+        f"- 목표 글자 수: **{target_min}~{target_max}자** (범위 유지)\n"
+        f"- 피드백과 관련 없는 부분은 **그대로 유지** (최소 침습적 수정)\n"
+        f"- 원본에 없는 사실(수치·도구·경험) 창작 절대 금지\n"
+        f"- 문단 3개 이상 유지, 모든 문장은 '~습니다.'로 종결\n"
+        f"- 수정된 자소서 본문만 출력 (설명·인사말 금지)\n\n"
+        f"[원본 - 사실 기준]\n{original_text}\n\n"
+        f"[현재 결과 - 수정 대상]\n{current_text}"
+    )

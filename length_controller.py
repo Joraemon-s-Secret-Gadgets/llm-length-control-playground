@@ -145,3 +145,82 @@ class LengthController:
             "attempts": MAX_RETRIES,
             "errors": last_errors,
         }
+
+
+    async def revise_text(
+            self,
+            original_text: str,
+            current_text: str,
+            user_feedback: str,
+            min_len: int,
+            max_len: int,
+            on_token=None,
+            on_status=None,
+    ) -> dict:
+        """
+        사용자 피드백을 반영해 기존 결과물을 수정한다.
+
+        Args:
+            original_text: 원본 자소서 (사실 검증 기준)
+            current_text: 현재 결과물 (수정 대상)
+            user_feedback: 사용자의 수정 요청 (자연어)
+            min_len, max_len: 유지할 글자 수 범위
+            on_token, on_status: UI 콜백
+
+        Returns:
+            adjust_length와 동일한 형식의 결과 dict
+        """
+        from prompts import build_revision_prompt
+
+        original_num_set = extract_numbers(original_text)
+        user_prompt = build_revision_prompt(
+            original_text, current_text, user_feedback, min_len, max_len
+        )
+
+        if on_status:
+            await on_status(f"✏️ 피드백 반영 중: \"{user_feedback[:30]}...\"")
+
+        stream = await self.client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=True,
+            temperature=0.3,  # 수정은 안정적으로
+        )
+
+        raw_text = ""
+        async for chunk in stream:
+            if chunk.choices[0].delta.content is not None:
+                token = chunk.choices[0].delta.content
+                raw_text += token
+                if on_token:
+                    await on_token(token)
+
+        # 후처리 파이프라인 (adjust_length와 동일)
+        processed = fix_korean_sentence_endings(raw_text)
+        processed = ensure_paragraphs(processed, sentences_per_paragraph=3)
+        processed = smart_trim(processed, min_len, max_len)
+        processed = fix_korean_sentence_endings(processed)
+
+        final_len = count_with_spaces(processed)
+        paragraph_count = count_paragraphs(processed)
+
+        # 검증
+        errors = []
+        if not (min_len <= final_len <= max_len):
+            errors.append(f"글자 수 {final_len}자 (목표 {min_len}~{max_len})")
+        if paragraph_count < 3:
+            errors.append(f"문단 {paragraph_count}개 (최소 3개)")
+
+        fabricated = detect_fabricated_numbers(original_num_set, processed)
+        if fabricated:
+            errors.append(f"원문에 없는 수치: {', '.join(fabricated[:3])}")
+
+        return {
+            "success": len(errors) == 0,
+            "text": processed,
+            "length": final_len,
+            "errors": errors,
+        }
